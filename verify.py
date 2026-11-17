@@ -51,6 +51,16 @@ def main():
     assert request('/api/state', host='evil.example')[0] == 403
     assert request('/v1/models', token='invalid')[0] == 401
     print('PASS: CSRF / Host / gateway credential rejection enforced')
+    assert server.remap_model('claude-opus-4-8') == server.CLAUDE_MODEL_FALLBACK
+    assert server.remap_model('claude-haiku-4-5-20251001') == server.CLAUDE_MODEL_RULES[0][1]
+    assert server.remap_model('claude-sonnet-4-5-20250929') == server.CLAUDE_MODEL_FALLBACK
+    assert server.remap_model('some-other-model') == 'some-other-model'
+    assert json.loads(server.remap_claude_body(b'{"model":"claude-opus-4-8","messages":[]}'))['model'] == server.CLAUDE_MODEL_FALLBACK
+    assert server.remap_claude_body(b'not-json') == b'not-json'
+    print('PASS: claude model name remapping')
+    code, raw, _ = request('/api/switch-all', {'host': 'no-such-host.invalid'}, csrf=csrf)
+    assert code == 400 and '没有' in raw.decode()
+    print('PASS: /api/switch-all validates unknown host')
     original_active = data['codex']['active']
     code, raw, _ = request('/api/add', {'app': 'codex', 'baseUrl': 'http://上游地址:8080/v1', 'key': 'sk-verify-add-test'}, csrf=csrf)
     assert code == 200, raw.decode()

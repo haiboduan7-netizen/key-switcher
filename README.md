@@ -9,15 +9,33 @@
 | 站点 A 日额度耗尽 | 改配置 + 重启客户端 | 页面点一下切到 B，后续请求即时生效 |
 | key 轮换 | 改环境变量 / 改配置文件 | 页面粘贴新 key 保存即可 |
 | 新增一个站点 / 换服务商 | 又要改一轮配置 | 页面「+ 添加站点」，填地址和 key 即可参与切换 |
-| 多客户端共用多站点 | 每个客户端单独配 | 全部指向 127.0.0.1:18791，一处切换 |
+| 多客户端共用多站点 | 每个客户端单独配 | 一处切换，四个客户端同时生效 |
 
-## 三个通道（各自独立切换）
+## 四个受控客户端
 
-| 通道 | 适用客户端 | 协议 | 客户端连接地址 |
-|---|---|---|---|
-| Codex | Codex CLI / 桌面端 | OpenAI Responses | `http://127.0.0.1:18791/v1` |
-| Claude Code | Claude Code / Anthropic 客户端 | Anthropic Messages | `http://127.0.0.1:18791` |
-| WorkBuddy | 任意 OpenAI Chat Completions 客户端 | OpenAI Chat | `http://127.0.0.1:18791/v1` |
+页面上每个站点卡片都有 **「全站切此站」** 按钮：一次点击，把 Codex、Claude Code、Claude 桌面端、WorkBuddy 全部切到该站点，即时生效、无需重启任何客户端。
+
+| 客户端 | 控制方式 | 说明 |
+|---|---|---|
+| Codex（CLI / 桌面端） | 本机网关 18791 | 网关转发；切换时自动把会话级 provider 快照、认证 key 与兜底线路一起归位 |
+| Claude Code（CLI） | cc-switch 托管 | 若本机装了 cc-switch，直接写其配置库，热生效 |
+| Claude 桌面端 | cc-switch 托管 | 同上（`claude-desktop` 线路，base_url 自动补 `/v1`） |
+| WorkBuddy | 本机网关 18791 | OpenAI Chat 协议，模型名透传 |
+
+> **注意**：Claude 线路由本工具写入 cc-switch 后，请不要再在 cc-switch 界面里手动切供应商，否则会互相覆盖。未安装 cc-switch 时，Claude Code 走本机网关（`~/.claude/settings.json`）。
+
+### Claude 模型名自动映射
+
+Claude 客户端发出的模型名（`claude-opus-*` / `claude-sonnet-*` / `claude-haiku-*`）上游站点往往不认识。网关会在转发前按规则改写模型名，默认映射到通用 OpenAI 模型，可用环境变量覆盖：
+
+```
+KS_MAP_HAIKU=gpt-4o-mini   # claude-haiku-* → ?
+KS_MAP_OPUS=gpt-4o         # claude-opus-* → ?
+KS_MAP_SONNET=gpt-4o       # claude-sonnet-* → ?
+KS_MAP_FALLBACK=gpt-4o     # 其它 claude-* → ?
+```
+
+非 claude 开头的模型名原样透传，不影响 Codex / WorkBuddy 通道。
 
 ## 快速开始
 

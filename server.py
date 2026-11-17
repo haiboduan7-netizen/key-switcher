@@ -21,11 +21,48 @@ PORT = 18791
 ADDRESS = f'http://127.0.0.1:{PORT}'
 CC_SWITCH_DB = Path.home() / '.cc-switch' / 'cc-switch.db'
 CLAUDE_SETTINGS = Path.home() / '.claude' / 'settings.json'
+CODEX_STATE = Path.home() / '.codex' / 'state_5.sqlite'
+CODEX_AUTH = Path.home() / '.codex' / 'auth.json'
 LOCK = threading.RLock()
 EVENTS = []
 CSRF = secrets.token_urlsafe(32)
 APPS = {'codex': 'Codex', 'claude': 'Claude Code', 'workbuddy': 'WorkBuddy'}
 WORKBUDDY_MODELS = Path.home() / '.workbuddy' / 'models.json'
+
+# Claude 桌面端/CLI 会发送自家模型名（如 claude-opus-4-8、claude-haiku-4-5），
+# 上游站点只认自己的模型名，这里统一映射，避免切换站点后出现 model_not_found。
+# 映射目标可通过环境变量覆盖：KS_MAP_HAIKU / KS_MAP_OPUS / KS_MAP_SONNET / KS_MAP_FALLBACK
+CLAUDE_MODEL_RULES = (
+    ('haiku', os.environ.get('KS_MAP_HAIKU', 'gpt-4o-mini')),
+    ('opus', os.environ.get('KS_MAP_OPUS', 'gpt-4o')),
+    ('sonnet', os.environ.get('KS_MAP_SONNET', 'gpt-4o')),
+)
+CLAUDE_MODEL_FALLBACK = os.environ.get('KS_MAP_FALLBACK', 'gpt-4o')
+
+def remap_model(name):
+    low = name.lower()
+    for keyword, target in CLAUDE_MODEL_RULES:
+        if keyword in low:
+            return target
+    if low.startswith('claude'):
+        return CLAUDE_MODEL_FALLBACK
+    return name
+
+def remap_claude_body(body):
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(payload, dict):
+        return body
+    model = payload.get('model')
+    if not isinstance(model, str) or not model:
+        return body
+    target = remap_model(model)
+    if target == model:
+        return body
+    payload['model'] = target
+    return json.dumps(payload, ensure_ascii=False).encode()
 
 class Blob(ctypes.Structure):
     _fields_ = [('cbData', wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
@@ -205,6 +242,31 @@ def integrated(app):
         hosts = {urlsplit(s['baseUrl']).hostname for s in data['workbuddy']['sites']}
         hits = [x for x in entries if isinstance(x, dict) and (urlsplit(str(x.get('url', ''))).hostname in hosts or x.get('url') == ADDRESS + '/v1')]
         return bool(hits) and all(x.get('url') == ADDRESS + '/v1' and x.get('apiKey') == data['workbuddyToken'] for x in hits)
+    if CC_SWITCH_DB.exists():
+        with LOCK:
+            data = load()
+        site = next((s for s in data['claude']['sites'] if s['id'] == data['claude']['active']), None)
+        if not site:
+            return False
+        base = site['baseUrl'].rstrip('/')
+        try:
+            con = sqlite3.connect(str(CC_SWITCH_DB), timeout=5)
+            rows = con.execute("select settings_config from providers where app_type in ('claude','claude-desktop') and is_current=1 and category<>'official'").fetchall()
+            con.close()
+        except Exception:
+            return False
+        if not rows:
+            return False
+        for (raw,) in rows:
+            try:
+                env = json.loads(raw).get('env', {})
+            except Exception:
+                return False
+            if env.get('ANTHROPIC_AUTH_TOKEN') != site['key']:
+                return False
+            if not str(env.get('ANTHROPIC_BASE_URL', '')).rstrip('/').startswith(base):
+                return False
+        return True
     if not CLAUDE_SETTINGS.exists():
         return False
     env = json.loads(CLAUDE_SETTINGS.read_text(encoding='utf-8-sig')).get('env', {})
@@ -214,6 +276,111 @@ def write_atomic(path, text):
     tmp = path.with_name(path.name + '.switcher-tmp')
     tmp.write_text(text, encoding='utf-8')
     os.replace(tmp, path)
+
+def cc_update(app_type, base_url, key):
+    """把 cc-switch 里该客户端当前启用的第三方线路改到指定上游，热生效（cc-switch 每次请求读库）。"""
+    if not CC_SWITCH_DB.exists():
+        return []
+    if not base_url or not key:
+        return []
+    changed = []
+    con = sqlite3.connect(str(CC_SWITCH_DB), timeout=8)
+    try:
+        con.execute('PRAGMA busy_timeout=6000')
+        rows = con.execute('select id, settings_config, is_current, category from providers where app_type=?', (app_type,)).fetchall()
+        for pid, raw, current, category in rows:
+            if current != 1:
+                continue
+            if category == 'official':
+                continue
+            try:
+                cfg = json.loads(raw)
+            except Exception:
+                continue
+            env = cfg.get('env')
+            if not isinstance(env, dict):
+                continue
+            if env.get('ANTHROPIC_BASE_URL') == base_url and env.get('ANTHROPIC_AUTH_TOKEN') == key:
+                continue
+            env['ANTHROPIC_BASE_URL'] = base_url
+            env['ANTHROPIC_AUTH_TOKEN'] = key
+            con.execute('update providers set settings_config=? where id=?', (json.dumps(cfg, ensure_ascii=False), pid))
+            changed.append(pid)
+        con.commit()
+    except Exception:
+        return []
+    finally:
+        con.close()
+    return changed
+
+def fix_codex_threads():
+    """Codex 会话级 provider 快照优先于全局配置，历史会话必须一起纠正。"""
+    if not CODEX_STATE.exists():
+        return 0
+    try:
+        con = sqlite3.connect(str(CODEX_STATE), timeout=8)
+        con.execute('PRAGMA busy_timeout=6000')
+        n = con.execute("update threads set model_provider='custom_gpt6' where model_provider<>'custom_gpt6'").rowcount
+        con.commit()
+        con.close()
+        return n
+    except Exception:
+        return 0
+
+def sync_codex(site):
+    """Codex 走本机网关；这里只保证兜底线路（auth.json + OpenAI 段）与当前站点一致。"""
+    notes = []
+    try:
+        changed = fix_codex_threads()
+        if changed:
+            notes.append(f'{changed} 个会话已归位到网关')
+    except Exception:
+        pass
+    try:
+        if CODEX_AUTH.exists() and site['key']:
+            auth = json.loads(CODEX_AUTH.read_text(encoding='utf-8-sig'))
+            if auth.get('OPENAI_API_KEY') != site['key']:
+                backup = CODEX_AUTH.with_name('auth.json.bak-switcher-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
+                backup.write_bytes(CODEX_AUTH.read_bytes())
+                auth['OPENAI_API_KEY'] = site['key']
+                auth['auth_mode'] = 'apikey'
+                write_atomic(CODEX_AUTH, json.dumps(auth, ensure_ascii=False, indent=2))
+                notes.append('Codex 认证 key 已同步')
+    except Exception:
+        pass
+    try:
+        if CONFIG.exists() and site['key']:
+            text = CONFIG.read_text(encoding='utf-8-sig')
+            origin = urlsplit(site['baseUrl'])
+            target_base = f'{origin.scheme}://{origin.netloc}/v1'
+            match = re.search(r'^\[model_providers\.OpenAI\]\s*\n(.*?)(?=^\[|\Z)', text, re.M | re.S)
+            if match:
+                block = match.group(0)
+                fixed = re.sub(r'^base_url\s*=.*$', 'base_url = "' + target_base + '"', block, count=1, flags=re.M)
+                if fixed != block:
+                    write_atomic(CONFIG, text.replace(block, fixed, 1))
+                    notes.append('Codex 兜底线路已同步')
+    except Exception:
+        pass
+    return notes
+
+def sync_claude(site):
+    """Claude CLI 与 Claude 桌面端都归 cc-switch 管，改库即热生效，无需重启客户端。"""
+    base = site['baseUrl'].rstrip('/')
+    api_base = base if base.endswith('/v1') else base + '/v1'
+    notes = []
+    if cc_update('claude', base, site['key']):
+        notes.append('Claude Code 线路已切换')
+    if cc_update('claude-desktop', api_base, site['key']):
+        notes.append('Claude 桌面端线路已切换')
+    return notes
+
+def apply_site(app, site):
+    if app == 'claude':
+        return sync_claude(site)
+    if app == 'codex':
+        return sync_codex(site)
+    return []
 
 def integrate(app):
     with LOCK:
@@ -252,6 +419,10 @@ def integrate(app):
             backup.write_bytes(WORKBUDDY_MODELS.read_bytes())
             write_atomic(WORKBUDDY_MODELS, json.dumps(entries, ensure_ascii=False, indent=2))
             return {'message': f'已备份并接入 WorkBuddy（{len(hits)} 个模型）。新开会话或重新选择模型后生效。', 'backup': str(backup)}
+        active = next((s for s in data['claude']['sites'] if s['id'] == data['claude']['active']), None)
+        if CC_SWITCH_DB.exists():
+            notes = sync_claude(active) if active else []
+            return {'message': 'Claude 由 cc-switch 统一托管，已把线路同步到当前站点。' + ('变更：' + '、'.join(notes) if notes else '（本已是当前站点）')}
         obj = json.loads(CLAUDE_SETTINGS.read_text(encoding='utf-8-sig'))
         env = obj.setdefault('env', {})
         if env.get('ANTHROPIC_BASE_URL') == ADDRESS and env.get('ANTHROPIC_AUTH_TOKEN') == data['claudeToken']:
@@ -304,6 +475,27 @@ class Handler(BaseHTTPRequestHandler):
             if size > 32768:
                 return self.reply(413, {'error': '请求过大'})
             payload = json.loads(self.rfile.read(size) or b'{}')
+            if self.path == '/api/switch-all':
+                host = str(payload.get('host', '')).strip()
+                if not host or len(host) > 253 or '/' in host:
+                    raise ValueError('请指定要切换到的站点主机')
+                notes, targets = [], {}
+                with LOCK:
+                    data = load()
+                    for name in APPS:
+                        target = next((s for s in data[name]['sites'] if urlsplit(s['baseUrl']).hostname == host), None)
+                        if target and target['key']:
+                            data[name]['active'] = target['id']
+                            targets[name] = dict(target)
+                    if not targets:
+                        raise ValueError('没有任何通道配置了这个站点，请先在该通道添加')
+                    save(data)
+                for name, target in targets.items():
+                    notes.extend(apply_site(name, target))
+                    notes.append(f'{APPS[name]} → {target["name"]}（{host}）')
+                result = snapshot()
+                result['notes'] = notes
+                return self.reply(200, result)
             if payload.get('app') not in APPS:
                 raise ValueError('未知的应用通道')
             app = payload['app']
@@ -337,6 +529,7 @@ class Handler(BaseHTTPRequestHandler):
                         current['status'] = result
                         save(data)
                 return self.reply(200, result)
+            notes = []
             with LOCK:
                 data = load()
                 site = next(s for s in data[app]['sites'] if s['id'] == payload['id'])
@@ -360,7 +553,11 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     return self.reply(404, {'error': 'Not found'})
                 save(data)
-            self.reply(200, snapshot())
+                if self.path == '/api/activate':
+                    notes = apply_site(app, site)
+            result = snapshot()
+            result['notes'] = notes
+            self.reply(200, result)
         except (KeyError, StopIteration, ValueError) as e:
             self.reply(400, {'error': str(e) or '站点不存在'})
         except Exception:
@@ -393,6 +590,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Transfer-Encoding') or size > 64 * 1024 * 1024:
                 return self.reply(413, {'error': '不支持此请求体大小或编码'})
             body = self.rfile.read(size) if size else None
+            if body and app == 'claude':
+                body = remap_claude_body(body)
             conn, prefix = connection(site, 300)
             skip = {'host', 'authorization', 'connection', 'content-length', 'transfer-encoding', 'accept-encoding', 'cookie', 'proxy-authorization', 'upgrade'}
             headers = {k: v for k, v in self.headers.items() if k.lower() not in skip}
