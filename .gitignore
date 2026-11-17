@@ -1,0 +1,9 @@
+# 运行时产物（含本机加密密钥，绝不能提交）
+vault.dpapi
+watchdog.log
+vault.tmp
+
+# 备份与缓存
+*.bak-*
+*.switcher-tmp
+__pycache__/
